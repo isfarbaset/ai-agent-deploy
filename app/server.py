@@ -1,245 +1,182 @@
+import os
+import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
-from langserve import add_routes
 from pydantic import BaseModel
-
-from langchain_core.tools import tool
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable
-from langchain_aws import ChatBedrock
 import boto3
-from typing import Annotated
-from typing_extensions import TypedDict
-from langgraph.graph.message import AnyMessage, add_messages
-from langchain_core.messages import ToolMessage
-from langchain_core.runnables import RunnableLambda
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, StateGraph, START
-from langgraph.prebuilt import tools_condition
-import os
-from langchain_core.messages import HumanMessage
-from dotenv import load_dotenv
+from colorama import init, Fore, Style
 
-# Load environment variables from .env file
-load_dotenv()
+# ----------------------------
+# Setup Logging with Colorama
+# ----------------------------
+init(autoreset=True)
 
-# Access the environment variables
-TAVILY_API_KEY = os.getenv('TAVILY_API_KEY')
+class ColoredFormatter(logging.Formatter):
+    def format(self, record):
+        msg = record.msg
+        if isinstance(msg, list):
+            formatted_messages = []
+            for m in msg:
+                cname = m.__class__.__name__
+                if cname == 'HumanMessage':
+                    formatted = f"{Fore.GREEN}[Human] {m.content}"
+                elif cname == 'AIMessage':
+                    formatted = f"{Fore.BLUE}[AI] {m.content}"
+                elif cname == 'ToolMessage':
+                    formatted = f"{Fore.YELLOW}[Tool] {m.content}"
+                else:
+                    formatted = str(m)
+                formatted_messages.append(formatted)
+            record.msg = "\n".join(formatted_messages)
+        return super().format(record)
 
-app = FastAPI()
+logger = logging.getLogger(__name__)
+handler = logging.StreamHandler()
+handler.setFormatter(ColoredFormatter("%(message)s"))
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# ----------------------------
+# FastAPI App Initialization
+# ----------------------------
+app = FastAPI(title="Solar Panel AI Agent", 
+              description="Customer support agent for Solar Panels Belgium")
 
 @app.get("/")
 async def redirect_root_to_docs():
     return RedirectResponse("/docs")
 
-# Tools
+# ----------------------------
+# Solar Panel Savings Tool
+# ----------------------------
+from langchain_core.tools import tool
+
 @tool
-def compute_savings(monthly_cost: float) -> float:
+def compute_savings(monthly_cost: float) -> dict:
     """
-    Tool to compute the potential savings when switching to solar energy based on the user's monthly electricity cost.
+    Compute potential savings for switching to solar energy given a monthly electricity cost.
     
     Args:
         monthly_cost (float): The user's current monthly electricity cost.
-    
+        
     Returns:
-        dict: A dictionary containing:
-            - 'number_of_panels': The estimated number of solar panels required.
-            - 'installation_cost': The estimated installation cost.
-            - 'net_savings_10_years': The net savings over 10 years after installation costs.
+        dict: Contains:
+            - 'number_of_panels': Estimated number of panels required.
+            - 'installation_cost': Estimated cost for installation.
+            - 'net_savings_10_years': Net savings over 10 years.
     """
-    def calculate_solar_savings(monthly_cost):
-        # Assumptions for the calculation
-        cost_per_kWh = 0.28  
-        cost_per_watt = 1.50  
-        sunlight_hours_per_day = 3.5  
-        panel_wattage = 350  
-        system_lifetime_years = 10  
+    cost_per_kWh = 0.28  
+    cost_per_watt = 1.50  
+    sunlight_hours_per_day = 3.5  
+    panel_wattage = 350  
+    system_lifetime_years = 10  
 
-        # Monthly electricity consumption in kWh
-        monthly_consumption_kWh = monthly_cost / cost_per_kWh
-        
-        # Required system size in kW
-        daily_energy_production = monthly_consumption_kWh / 30
-        system_size_kW = daily_energy_production / sunlight_hours_per_day
-        
-        # Number of panels and installation cost
-        number_of_panels = system_size_kW * 1000 / panel_wattage
-        installation_cost = system_size_kW * 1000 * cost_per_watt
-        
-        # Annual and net savings
-        annual_savings = monthly_cost * 12
-        total_savings_10_years = annual_savings * system_lifetime_years
-        net_savings = total_savings_10_years - installation_cost
-        
-        return {
-            "number_of_panels": round(number_of_panels),
-            "installation_cost": round(installation_cost, 2),
-            "net_savings_10_years": round(net_savings, 2)
-        }
-
-    # Return calculated solar savings
-    return calculate_solar_savings(monthly_cost)
-
-# Utilities
-def handle_tool_error(state) -> dict:
-    """
-    Function to handle errors that occur during tool execution.
+    monthly_consumption_kWh = monthly_cost / cost_per_kWh    
+    daily_energy_production = monthly_consumption_kWh / 30
+    system_size_kW = daily_energy_production / sunlight_hours_per_day    
+    number_of_panels = system_size_kW * 1000 / panel_wattage
+    installation_cost = system_size_kW * 1000 * cost_per_watt    
+    annual_savings = monthly_cost * 12
+    total_savings_10_years = annual_savings * system_lifetime_years
+    net_savings = total_savings_10_years - installation_cost
     
-    Args:
-        state (dict): The current state of the AI agent, which includes messages and tool call details.
-    
-    Returns:
-        dict: A dictionary containing error messages for each tool that encountered an issue.
-    """
-    # Retrieve the error from the current state
-    error = state.get("error")
-    
-    # Access the tool calls from the last message in the state's message history
-    tool_calls = state["messages"][-1].tool_calls
-    
-    # Return a list of ToolMessages with error details, linked to each tool call ID
     return {
-        "messages": [
-            ToolMessage(
-                content=f"Error: {repr(error)}\n please fix your mistakes.",  # Format the error message for the user
-                tool_call_id=tc["id"],  # Associate the error message with the corresponding tool call ID
-            )
-            for tc in tool_calls  # Iterate over each tool call to produce individual error messages
-        ]
+        "number_of_panels": round(number_of_panels),
+        "installation_cost": round(installation_cost, 2),
+        "net_savings_10_years": round(net_savings, 2)
     }
 
-def create_tool_node_with_fallback(tools: list) -> dict:
-    """
-    Function to create a tool node with fallback error handling.
-    
-    Args:
-        tools (list): A list of tools to be included in the node.
-    
-    Returns:
-        dict: A tool node that uses fallback behavior in case of errors.
-    """
-    # Create a ToolNode with the provided tools and attach a fallback mechanism
-    # If an error occurs, it will invoke the handle_tool_error function to manage the error
-    return ToolNode(tools).with_fallbacks(
-        [RunnableLambda(handle_tool_error)],  # Use a lambda function to wrap the error handler
-        exception_key="error"  # Specify that this fallback is for handling errors
-    )
+# ----------------------------
+# Agent Setup using Latest Structure
+# ----------------------------
+from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_aws import ChatBedrockConverse
 
-### State
-class State(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-
-class Assistant:
-    def __init__(self, runnable: Runnable):
-        # Initialize with the runnable that defines the process for interacting with the tools
-        self.runnable = runnable
-
-    def __call__(self, state: State):
-        while True:
-            # Invoke the runnable with the current state (messages and context)
-            result = self.runnable.invoke(state)
-            
-            # If the tool fails to return valid output, re-prompt the user to clarify or retry
-            if not result.tool_calls and (
-                not result.content
-                or isinstance(result.content, list)
-                and not result.content[0].get("text")
-            ):
-                # Add a message to request a valid response
-                messages = state["messages"] + [("user", "Respond with a real output.")]
-                state = {**state, "messages": messages}
-            else:
-                # Break the loop when valid output is obtained
-                break
-
-        # Return the final state after processing the runnable
-        return {"messages": result}
-
-
-# LLM with function call
-def get_bedrock_client(region):
-    return boto3.client("bedrock-runtime", region_name=region)
-
-def create_bedrock_llm(client):
-    #return ChatBedrock(model_id='anthropic.claude-3-sonnet-20240229-v1:0', client=client, model_kwargs={'temperature': 0}, region_name='us-east-1')
-    return ChatBedrock(model_id='us.anthropic.claude-3-5-sonnet-20241022-v2:0', client=client, model_kwargs={'temperature': 0}, region_name='us-east-1')
-
-llm = create_bedrock_llm(get_bedrock_client(region = 'us-east-1'))
-
-primary_assistant_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            '''You are a helpful customer support assistant for Solar Panels Belgium.
-            You should get the following information from them:
-            - monthly electricity cost
-            If you are not able to discern this info, ask them to clarify! Do not attempt to wildly guess.
-
-            After you are able to discern all the information, call the relevant tool.
-            ''',
-        ),
-        ("placeholder", "{messages}"),
-    ]
+# Define system prompt
+SYSTEM_PROMPT = (
+    "You are a helpful customer support assistant for Solar Panels Belgium. "
+    "Your goal is to extract the user's monthly electricity cost and, when provided, "
+    "calculate potential savings using the compute_savings tool. "
+    "If the cost is missing, ask for clarification."
 )
 
-part_1_tools = [
-    TavilySearchResults(max_results=1),
-    compute_savings
-]
-part_1_assistant_runnable = primary_assistant_prompt | llm.bind_tools(part_1_tools)
+# Tools available to the agent
+tools = [compute_savings]
 
-# Graph
+# Initialize Bedrock client
+def get_bedrock_client():
+    return boto3.client("bedrock-runtime", region_name="us-east-1")
 
-builder = StateGraph(State)
+# Define a memory store for conversation history
+conversation_memory = {}
 
-
-# Define nodes: these do the work
-builder.add_node("assistant", Assistant(part_1_assistant_runnable))
-builder.add_node("tools", create_tool_node_with_fallback(part_1_tools))
-
-# Define edges: these determine how the control flow moves
-builder.add_edge(START, "assistant")
-builder.add_conditional_edges(
-    "assistant",
-    tools_condition,
-)
-builder.add_edge("tools", "assistant")
-
-# The checkpointer lets the graph persist its state
-# this is a complete memory for the entire graph.
-memory = MemorySaver()
-graph = builder.compile(checkpointer=memory)
-
-# Define Pydantic model for request body
+# ----------------------------
+# Request Model for API Input
+# ----------------------------
 class QuestionRequest(BaseModel):
     question: str
-    thread_id: int
+    thread_id: int  # Used for conversation tracking
 
-# Add a route to run the ai agent
+# ----------------------------
+# API Endpoint to Run the Agent
+# ----------------------------
 @app.post("/generate")
 async def generate_route(request: QuestionRequest):
-    print(request)
-    state = {"messages": [HumanMessage(content=request.question)]}
-    config={"configurable": {"thread_id": request.thread_id}}
-    # print(state)
     try:
+        logger.info(f"Received request: {request}")
+        
+        # Get or initialize conversation memory for this thread
+        if request.thread_id not in conversation_memory:
+            conversation_memory[request.thread_id] = []
+        
+        # Initialize the model and client for each request
+        # This ensures fresh credentials and prevents timeout issues
+        bedrock_client = get_bedrock_client()
+        model = ChatBedrockConverse(
+            client=bedrock_client,
+            model="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+            temperature=0,
+            max_tokens=500
+        )
+        
+        # Create the agent with the model and tools
+        agent_executor = create_react_agent(model, tools)
+        
+        # Build messages with system message at the start if thread is new
+        messages = conversation_memory[request.thread_id]
+        if not messages:
+            messages.append(SystemMessage(content=SYSTEM_PROMPT))
+        
+        # Add the new user message
+        messages.append(HumanMessage(content=request.question))
+        
+        # Invoke the agent
+        response = agent_executor.invoke({"messages": messages})
+        logger.info(response["messages"])
+        
+        # Update conversation memory
+        conversation_memory[request.thread_id] = response["messages"]
+        
+        # Return the full conversation for the client
         outputs = []
-        for output in graph.stream(state, config):
-            print(output)
-            for key, value in output.items():
-                outputs.append({key: value})
-        print('outputs', outputs)
-        # return output
+        for message in response["messages"]:
+            message_type = message.__class__.__name__.lower().replace("message", "")
+            outputs.append({
+                "role": message_type,
+                "content": message.content
+            })
+        
         return {"result": outputs}
+        
     except Exception as e:
+        logger.error(f"Error in agent processing: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-    
-# Edit this to add the chain you want to add
-# add_routes(app, NotImplemented)
 
+# ----------------------------
+# Run the FastAPI App
+# ----------------------------
 if __name__ == "__main__":
     import uvicorn
-
+    logger.info("Starting Solar Panel AI Agent server...")
     uvicorn.run(app, host="0.0.0.0", port=8001)
