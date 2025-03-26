@@ -163,7 +163,8 @@ def get_bedrock_client(region):
     return boto3.client("bedrock-runtime", region_name=region)
 
 def create_bedrock_llm(client):
-    return ChatBedrock(model_id='anthropic.claude-3-sonnet-20240229-v1:0', client=client, model_kwargs={'temperature': 0}, region_name='us-east-1')
+    #return ChatBedrock(model_id='anthropic.claude-3-sonnet-20240229-v1:0', client=client, model_kwargs={'temperature': 0}, region_name='us-east-1')
+    return ChatBedrock(model_id='us.anthropic.claude-3-5-sonnet-20241022-v2:0', client=client, model_kwargs={'temperature': 0}, region_name='us-east-1')
 
 llm = create_bedrock_llm(get_bedrock_client(region = 'us-east-1'))
 
